@@ -1,240 +1,337 @@
 import streamlit as st
 import chess
 import chess.svg
+import chess.engine
 import firebase_admin
 from firebase_admin import credentials, firestore
 import base64
 import time
 import random
+import json
 
 # --- KONFIGURACJA STRONY ---
-st.set_page_config(page_title="Szachy Online - Alanooo!", layout="wide")
+st.set_page_config(page_title="Szachy Klasyczne", layout="wide")
 
-# --- STYL (Twoja klasyka + drewno) ---
+# --- STYLE CSS (DREWNIANY KLIMAT) ---
 st.markdown("""
     <style>
     .stApp { background-color: #f0d9b5; background-image: linear-gradient(to bottom, #f0d9b5, #b58863); }
     .main-header { font-family: 'Times New Roman', serif; color: #4a2c2a; text-align: center; text-shadow: 2px 2px #b58863; }
     .chess-board { margin: auto; border: 15px solid #5c3a2e; border-radius: 5px; box-shadow: 10px 10px 30px rgba(0,0,0,0.5); }
     .chat-box { border: 2px solid #5c3a2e; background-color: #fffaf0; padding: 10px; height: 300px; overflow-y: scroll; border-radius: 10px; color: black; }
+    .game-info { background-color: #5c3a2e; color: #f0d9b5; padding: 10px; border-radius: 5px; text-align: center; margin-bottom: 10px; font-weight: bold; }
     .author-signature { position: fixed; bottom: 10px; right: 10px; font-family: 'Brush Script MT', cursive; font-size: 24px; color: #4a2c2a; }
-    /* Ukrycie standardowego menu dla lepszego wyglądu */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
+    
+    /* Stylizacja przycisków */
+    .stButton>button {
+        color: #f0d9b5;
+        background-color: #5c3a2e;
+        border: 2px solid #3e2723;
+    }
+    .stButton>button:hover {
+        background-color: #795548;
+        border-color: #f0d9b5;
+    }
     </style>
     """, unsafe_allow_html=True)
 
-# --- KONFIGURACJA FIREBASE (ZAKTUALIZOWANA DLA CHMURY) ---
+# --- KONFIGURACJA FIREBASE ---
 if not firebase_admin._apps:
     try:
-        # Sprawdzamy, czy aplikacja ma dostęp do sekretów Streamlit (Chmura)
+        # Sprawdzamy sekrety Streamlit Cloud
         if "firebase" in st.secrets:
-            # Tworzymy słownik z danych w sekretach
             key_dict = dict(st.secrets["firebase"])
-            # Naprawiamy format klucza prywatnego (czasem \n są źle interpretowane)
+            # Fix na znaki nowej linii w kluczu prywatnym
             key_dict["private_key"] = key_dict["private_key"].replace("\\n", "\n")
-            
             cred = credentials.Certificate(key_dict)
             firebase_admin.initialize_app(cred)
-        # Jeśli nie ma sekretów, szukamy pliku lokalnie (Twój komputer)
         else:
+            # Fallback dla lokalnego uruchomienia (jeśli masz plik)
             cred = credentials.Certificate("firestore_key.json")
             firebase_admin.initialize_app(cred)
-            
-        print("Połączono z Firebase!")
     except Exception as e:
-        st.error(f"Błąd połączenia z bazą danych: {e}")
-        st.stop()
-
+        st.warning("⚠️ Brak połączenia z bazą danych. Upewnij się, że skonfigurowałeś 'Secrets' w panelu Streamlit.")
+        # Nie zatrzymujemy appki całkowicie, żeby pokazała chociaż interfejs
+        
 db = firestore.client()
 
 # --- STANY APLIKACJI ---
 if 'board' not in st.session_state:
     st.session_state.board = chess.Board()
+if 'game_mode' not in st.session_state:
+    st.session_state.game_mode = "MENU" # MENU, BOT, ONLINE
+if 'bot_difficulty' not in st.session_state:
+    st.session_state.bot_difficulty = "Easy"
+if 'user_points' not in st.session_state:
+    st.session_state.user_points = 0 # START OD ZERA
+if 'nick' not in st.session_state:
+    st.session_state.nick = "Gracz_" + str(random.randint(100, 999))
 if 'game_id' not in st.session_state:
     st.session_state.game_id = None
 if 'my_color' not in st.session_state:
-    st.session_state.my_color = None # "WHITE" lub "BLACK"
+    st.session_state.my_color = chess.WHITE
 if 'last_fen' not in st.session_state:
     st.session_state.last_fen = chess.STARTING_FEN
 
-# --- FUNKCJE FIREBASE (SERCE ONLINE) ---
+# --- LOGIKA BOTÓW ---
+def get_bot_move(board, level):
+    legal_moves = list(board.legal_moves)
+    if not legal_moves: return None
+    
+    if level == "Tryb żółtodzioba":
+        return random.choice(legal_moves)
+    
+    elif level == "Tryb bystrzachy":
+        captures = [m for m in legal_moves if board.is_capture(m)]
+        if captures and random.random() < 0.7: return random.choice(captures)
+        return random.choice(legal_moves)
+    
+    elif level == "Tryb maniaka tęgiej głowy":
+        best_move = random.choice(legal_moves)
+        best_score = -9999
+        values = {chess.PAWN:1, chess.KNIGHT:3, chess.BISHOP:3, chess.ROOK:5, chess.QUEEN:9, chess.KING:0}
+        
+        for move in legal_moves:
+            board.push(move)
+            score = 0
+            for piece_type in values:
+                score += len(board.pieces(piece_type, board.turn)) * values[piece_type]
+                score -= len(board.pieces(piece_type, not board.turn)) * values[piece_type]
+            board.pop()
+            if score > best_score:
+                best_score = score
+                best_move = move
+        return best_move
 
-def create_or_join_game(user_nick, user_points):
-    # 1. Szukamy gry gdzie ktoś czeka (status: 'waiting')
-    games_ref = db.collection('games')
-    query = games_ref.where('status', '==', 'waiting').limit(1).stream()
-    
-    found_game = None
-    for game in query:
-        found_game = game
-        break
-    
-    if found_game:
-        # DOŁĄCZANIE DO GRY
-        game_id = found_game.id
-        games_ref.document(game_id).update({
-            'player_black': user_nick,
-            'player_black_points': user_points,
+# --- LOGIKA ONLINE ---
+def create_online_game(time_control):
+    new_game = {
+        'player_white': st.session_state.nick,
+        'player_white_points': st.session_state.user_points,
+        'player_black': None,
+        'status': 'waiting',
+        'fen': chess.STARTING_FEN,
+        'time_control': time_control,
+        'chat': [],
+        'created_at': firestore.SERVER_TIMESTAMP
+    }
+    try:
+        doc_ref = db.collection('games').document()
+        doc_ref.set(new_game)
+        st.session_state.game_id = doc_ref.id
+        st.session_state.my_color = chess.WHITE
+        st.session_state.board = chess.Board()
+        st.session_state.game_mode = "ONLINE"
+        st.rerun()
+    except Exception as e:
+        st.error(f"Błąd tworzenia gry. Sprawdź konfigurację Firebase. {e}")
+
+def join_online_game(game_id):
+    try:
+        db.collection('games').document(game_id).update({
+            'player_black': st.session_state.nick,
+            'player_black_points': st.session_state.user_points,
             'status': 'active'
         })
         st.session_state.game_id = game_id
         st.session_state.my_color = chess.BLACK
-        st.toast(f"Dołączono do gry! Twoim rywalem jest {found_game.to_dict().get('player_white')}")
-    else:
-        # TWORZENIE NOWEJ GRY
-        new_game_ref = games_ref.document()
-        new_game_ref.set({
-            'player_white': user_nick,
-            'player_white_points': user_points,
-            'player_black': None,
-            'status': 'waiting',
-            'fen': chess.STARTING_FEN,
-            'last_move': None,
-            'chat': [],
-            'created_at': firestore.SERVER_TIMESTAMP
-        })
-        st.session_state.game_id = new_game_ref.id
-        st.session_state.my_color = chess.WHITE
-        st.toast("Utworzono pokój. Czekanie na rywala...")
+        st.session_state.board = chess.Board()
+        st.session_state.game_mode = "ONLINE"
+        st.rerun()
+    except Exception as e:
+        st.error(f"Błąd dołączania. {e}")
 
 def sync_game():
-    """Pobiera stan gry z bazy i aktualizuje planszę"""
-    if not st.session_state.game_id:
-        return
-
-    doc_ref = db.collection('games').document(st.session_state.game_id)
-    doc = doc_ref.get()
-    
-    if doc.exists:
-        data = doc.to_dict()
-        
-        # Aktualizacja FEN (układu figur)
-        server_fen = data.get('fen')
-        if server_fen and server_fen != st.session_state.last_fen:
-            st.session_state.board.set_fen(server_fen)
-            st.session_state.last_fen = server_fen
-            # Jeśli to była tura przeciwnika i on wykonał ruch, odświeżamy stronę
-            st.rerun()
-
-        # Zwracamy dane do wyświetlenia (czat, status)
-        return data
+    if not st.session_state.game_id: return None
+    try:
+        doc = db.collection('games').document(st.session_state.game_id).get()
+        if doc.exists:
+            data = doc.to_dict()
+            if data['fen'] != st.session_state.last_fen:
+                st.session_state.board.set_fen(data['fen'])
+                st.session_state.last_fen = data['fen']
+                st.rerun()
+            return data
+    except:
+        pass
     return None
 
-def push_move(move_uci):
-    """Wysyła ruch do bazy"""
-    if not st.session_state.game_id:
-        return
-
-    board = st.session_state.board
-    board.push(chess.Move.from_uci(move_uci))
-    new_fen = board.fen()
-    
+def push_online_move(move_uci):
+    st.session_state.board.push(chess.Move.from_uci(move_uci))
+    new_fen = st.session_state.board.fen()
     db.collection('games').document(st.session_state.game_id).update({
         'fen': new_fen,
         'last_move': move_uci
     })
     st.session_state.last_fen = new_fen
 
-def send_chat(msg, nick):
-    if st.session_state.game_id and msg:
-        chat_entry = f"<b>{nick}:</b> {msg}"
-        db.collection('games').document(st.session_state.game_id).update({
-            'chat': firestore.ArrayUnion([chat_entry])
-        })
-
-# --- UI GRAFICZNE ---
-def render_board(board):
-    board_svg = chess.svg.board(
+# --- UI PLANSZY ---
+def render_board(board, is_white):
+    svg = chess.svg.board(
         board,
         colors={'square light': '#f0d9b5', 'square dark': '#b58863', 'margin': '#5c3a2e'},
-        size=450,
-        flipped=(st.session_state.my_color == chess.BLACK) # Obraca planszę jeśli jesteś czarnymi
+        size=400,
+        flipped=not is_white
     )
-    b64 = base64.b64encode(board_svg.encode('utf-8')).decode("utf-8")
+    b64 = base64.b64encode(svg.encode('utf-8')).decode("utf-8")
     return f'<div class="chess-board"><img src="data:image/svg+xml;base64,{b64}"/></div>'
 
-# --- GŁÓWNA STRONA ---
-st.markdown("<h1 class='main-header'>♞ Szachy Klasyczne Online (Firebase) ♜</h1>", unsafe_allow_html=True)
+# --- GŁÓWNA PĘTLA APLIKACJI ---
+st.markdown("<h1 class='main-header'>♞ Szachy Klasyczne ♜</h1>", unsafe_allow_html=True)
 
+# Pasek boczny
 with st.sidebar:
-    st.header("👤 Profil")
-    nick = st.text_input("Twój Nick:", value="Gość")
-    points = st.number_input("Twoje Punkty:", value=100)
+    st.header("👤 Twój Profil")
+    st.session_state.nick = st.text_input("Nick:", st.session_state.nick)
+    st.metric("Punkty:", st.session_state.user_points)
     
     st.markdown("---")
-    if st.button("🔍 SZUKAJ GRY ONLINE"):
-        create_or_join_game(nick, points)
-        st.rerun()
-    
-    if st.button("❌ Wyjdź z gry"):
+    if st.button("🏠 MENU GŁÓWNE"):
+        st.session_state.game_mode = "MENU"
         st.session_state.game_id = None
-        st.session_state.board = chess.Board()
         st.rerun()
 
-# --- LOGIKA GRY ---
-
-if st.session_state.game_id:
-    # JESTEŚMY W GRZE - Synchronizacja
-    game_data = sync_game()
+# --- EKRAN MENU ---
+if st.session_state.game_mode == "MENU":
     
-    col1, col2 = st.columns([2, 1])
+    # Disclaimer bezpieczeństwa
+    st.warning("⚠️ PAMIĘTAJ: Nie podawaj nikomu danych osobowych ani haseł na czacie! Aplikacja jest darmowa.")
+
+    col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown(render_board(st.session_state.board), unsafe_allow_html=True)
-        
-        # Sprawdzanie czyja tura
-        is_white_turn = st.session_state.board.turn
-        my_turn = (is_white_turn and st.session_state.my_color == chess.WHITE) or \
-                  (not is_white_turn and st.session_state.my_color == chess.BLACK)
-
-        status_text = "🟢 Twoja tura!" if my_turn else "🔴 Tura przeciwnika..."
-        if game_data and game_data.get('status') == 'waiting':
-            status_text = "⏳ Oczekiwanie na dołączenie drugiego gracza..."
-            
-        st.subheader(status_text)
-
-        # Wykonywanie ruchu
-        if my_turn and game_data.get('status') == 'active':
-            move = st.text_input("Twój ruch (np. e2e4):", key="move_input")
-            if st.button("Wykonaj ruch"):
-                try:
-                    chess_move = chess.Move.from_uci(move)
-                    if chess_move in st.session_state.board.legal_moves:
-                        push_move(move)
-                        st.rerun()
-                    else:
-                        st.error("Ruch niedozwolony!")
-                except:
-                    st.error("Błędny format (użyj np. e2e4)")
-        elif not my_turn:
-            # Automatyczne odświeżanie co 3 sekundy, żeby zobaczyć ruch rywala
-            time.sleep(2) 
+        st.markdown("### 🤖 Gra z Botem")
+        difficulty = st.select_slider("Poziom trudności:", 
+            options=["Tryb żółtodzioba", "Tryb bystrzachy", "Tryb maniaka tęgiej głowy"])
+        if st.button("GRAJ Z BOTEM", use_container_width=True):
+            st.session_state.bot_difficulty = difficulty
+            st.session_state.game_mode = "BOT"
+            st.session_state.board = chess.Board()
             st.rerun()
 
     with col2:
-        st.subheader("💬 Czat")
-        chat_html = ""
-        if game_data and 'chat' in game_data:
-            for msg in game_data['chat']:
-                chat_html += f"<div>{msg}</div>"
+        st.markdown("### 🌍 Gra Online")
         
-        st.markdown(f'<div class="chat-box">{chat_html}</div>', unsafe_allow_html=True)
+        tab1, tab2 = st.tabs(["🆕 Stwórz Pokój", "🔍 Dołącz do Gry"])
         
-        new_msg = st.text_input("Wiadomość:", key="chat_in")
-        if st.button("Wyślij"):
-            send_chat(new_msg, nick)
-            st.rerun()
+        with tab1:
+            time_pref = st.selectbox("Czas gry:", ["Bez limitu", "20 min", "10 min", "5 min"])
+            if st.button("UTWÓRZ POKÓJ", use_container_width=True):
+                create_online_game(time_pref)
+        
+        with tab2:
+            st.write("Dostępne pokoje (oczekujące):")
+            if st.button("Odśwież listę"):
+                st.rerun()
+                
+            try:
+                games_ref = db.collection('games').where('status', '==', 'waiting').stream()
+                found = False
+                for g in games_ref:
+                    found = True
+                    g_data = g.to_dict()
+                    st.success(f"Gracz: {g_data.get('player_white')} | Czas: {g_data.get('time_control')} | Pkt: {g_data.get('player_white_points')}")
+                    if st.button(f"DOŁĄCZ DO GRY", key=g.id):
+                        join_online_game(g.id)
+                
+                if not found:
+                    st.info("Brak aktywnych pokoi. Stwórz własny!")
+            except:
+                st.write("Łączenie z bazą...")
 
-else:
-    # EKRAN STARTOWY
-    st.info("👋 Witaj! Wpisz swój nick po lewej i kliknij 'SZUKAJ GRY ONLINE', aby zagrać z prawdziwym człowiekiem.")
-    st.markdown("""
-    <div style='text-align: center; color: #5c3a2e;'>
-        <h3>Zasady bezpieczeństwa:</h3>
-        <p>Nie podawaj danych osobowych ani haseł na czacie.</p>
-    </div>
-    """, unsafe_allow_html=True)
+# --- EKRAN GRY Z BOTEM ---
+elif st.session_state.game_mode == "BOT":
+    st.markdown(f"<div class='game-info'>BOT: {st.session_state.bot_difficulty}</div>", unsafe_allow_html=True)
+    
+    col_b1, col_b2 = st.columns([2, 1])
+    with col_b1:
+        st.markdown(render_board(st.session_state.board, True), unsafe_allow_html=True)
+        
+        move_in = st.text_input("Twój ruch (np. e2e4):", key="bot_move")
+        if st.button("Wykonaj Ruch"):
+            try:
+                move = chess.Move.from_uci(move_in)
+                if move in st.session_state.board.legal_moves:
+                    st.session_state.board.push(move)
+                    # Ruch bota
+                    if not st.session_state.board.is_game_over():
+                        with st.spinner("Bot myśli..."):
+                            time.sleep(0.5)
+                            bot_move = get_bot_move(st.session_state.board, st.session_state.bot_difficulty)
+                            st.session_state.board.push(bot_move)
+                    st.rerun()
+                else:
+                    st.error("Nieprawidłowy ruch.")
+            except:
+                st.error("Błędny format.")
+
+        if st.session_state.board.is_checkmate():
+            st.balloons()
+            st.success("KONIEC GRY! SZACH MAT.")
+                
+# --- EKRAN GRY ONLINE ---
+elif st.session_state.game_mode == "ONLINE":
+    game_data = sync_game()
+    if not game_data:
+        st.write("Synchronizacja...")
+        time.sleep(1)
+        st.rerun()
+    else:
+        my_color_name = "Białe" if st.session_state.my_color == chess.WHITE else "Czarne"
+        opponent = game_data.get('player_black') if st.session_state.my_color == chess.WHITE else game_data.get('player_white')
+        if not opponent: opponent = "Oczekiwanie na rywala..."
+        
+        st.markdown(f"<div class='game-info'>Ty: <b>{my_color_name}</b> | Rywal: <b>{opponent}</b> | Czas: {game_data.get('time_control')}</div>", unsafe_allow_html=True)
+
+        col_o1, col_o2 = st.columns([2, 1])
+        
+        with col_o1:
+            st.markdown(render_board(st.session_state.board, st.session_state.my_color == chess.WHITE), unsafe_allow_html=True)
+            
+            is_my_turn = st.session_state.board.turn == st.session_state.my_color
+            
+            if game_data.get('status') == 'active':
+                if is_my_turn:
+                    st.success("🟢 TWOJA KOLEJ!")
+                    move_online = st.text_input("Twój ruch (np. e2e4):", key="online_move")
+                    if st.button("Wykonaj ruch"):
+                        try:
+                            m = chess.Move.from_uci(move_online)
+                            if m in st.session_state.board.legal_moves:
+                                push_online_move(move_online)
+                                if st.session_state.board.is_checkmate():
+                                    st.session_state.user_points += 10
+                                    st.balloons()
+                                st.rerun()
+                            else:
+                                st.error("Niedozwolony ruch")
+                        except:
+                            st.error("Format: e2e4")
+                else:
+                    st.info("🔴 RUCH PRZECIWNIKA...")
+                    time.sleep(2)
+                    st.rerun()
+            else:
+                st.warning("⏳ Czekamy aż ktoś dołączy do pokoju...")
+                time.sleep(3)
+                st.rerun()
+
+        with col_o2:
+            st.subheader("💬 Czat")
+            chat_box = ""
+            for msg in game_data.get('chat', []):
+                chat_box += f"<div style='border-bottom:1px solid #ddd; padding:2px;'>{msg}</div>"
+            st.markdown(f"<div class='chat-box'>{chat_box}</div>", unsafe_allow_html=True)
+            
+            msg_in = st.text_input("Napisz wiadomość:")
+            if st.button("Wyślij"):
+                if msg_in:
+                    new_msg = f"<b>{st.session_state.nick}:</b> {msg_in}"
+                    db.collection('games').document(st.session_state.game_id).update({
+                        'chat': firestore.ArrayUnion([new_msg])
+                    })
 
 st.markdown("---")
 st.markdown('<div class="author-signature">Wykonane przez: Alanooo!</div>', unsafe_allow_html=True)
